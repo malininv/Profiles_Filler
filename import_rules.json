@@ -1,0 +1,110 @@
+﻿{
+  "db_path": "ComponentsLib.db",
+  "table": "profiles",
+  "skip_lines": 1,
+  "encoding": "auto",
+  "encoding_try": [
+    "utf-8-sig",
+    "utf-8",
+    "cp1251",
+    "cp866"
+  ],
+  "numeric_columns": [
+    "mass_per_meter",
+    "sqr"
+  ],
+  "profile_name_uniquify": "header_stem_designation",
+  "comment": "Prefer UTF-8 first to avoid broken header_line in UTF-8 files.",
+  "profile_outlines": {
+    "table": "ProfileOutlines",
+    "id_column": "profile_outline_id",
+    "name_column": "outline_name",
+    "outline_symbol_column": "outline_symbol",
+    "outline_symbol_default": "",
+    "outline_image_column": "outline_image_binary",
+    "outline_image_file": null,
+    "outline_attributes": {},
+    "outlines": [
+      {
+        "outline_name": "Двутавр",
+        "outline_symbol": "][",
+        "outline_image_file": "images/2Tawr.png"
+      },
+      {
+        "outline_name": "Угол",
+        "outline_symbol": "∟",
+        "outline_image_file": "images/Ugol.png"
+      },
+      {
+        "outline_name": "Швеллер",
+        "outline_symbol": "[",
+        "outline_image_file": "images/Shweller.png"
+      },
+      {
+        "outline_name": "Квадратная труба",
+        "outline_symbol": "[]",
+        "outline_image_file": "images/TrubaKvadrat.png"
+      },
+      {
+        "outline_name": "Круглая труба",
+        "outline_symbol": "○",
+        "outline_image_file": "images/TrubaKrug.png"
+      },
+      {
+        "outline_name": "Тавр",
+        "outline_symbol": "┬",
+        "outline_image_file": "images/Tawr.png"
+      },
+      {
+        "outline_name": "Пруток",
+        "outline_symbol": "•",
+        "outline_image_file": "images/Prutok.png"
+      },
+      {
+        "outline_name": "Лист",
+        "outline_symbol": "_",
+        "outline_image_file": "images/List.png"
+      },
+      {
+        "outline_name": "Тонкостенные Z-профили",
+        "outline_symbol": "Z",
+        "outline_image_file": "images/Z.png"
+      }
+    ],
+    "folder_to_outline": {
+      "2Tawr": "Двутавр",
+      "Ugol": "Угол",
+      "Shweller": "Швеллер",
+      "TrubaKvadrat": "Квадратная труба",
+      "TrubaKrug": "Круглая труба",
+      "Tawr": "Тавр",
+      "Prutok": "Пруток",
+      "List": "Лист",
+      "Z": "Тонкостенные Z-профили"
+    }
+  },
+  "column_map": {
+    "profile_outline_id": {
+      "source": "outline_from_folder"
+    },
+    "profile_name": {
+      "source": "header_line"
+    },
+    "profile_code": {
+      "source": "filename_stem"
+    },
+    "profile_size": {
+      "source": "field_index",
+      "index": 0
+    },
+    "mass_per_meter": {
+      "source": "field_index",
+      "index": 1
+    },
+    "sqr": {
+      "source": "field_index",
+      "index": 2,
+      "optional": true
+    }
+  }
+}
