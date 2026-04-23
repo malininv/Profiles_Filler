@@ -277,6 +277,16 @@ def validate_columns(conn: sqlite3.Connection, table: str, columns: list[str]) -
         )
 
 
+def reset_sqlite_identity(conn: sqlite3.Connection, table: str) -> None:
+    _assert_safe_sql_ident(table)
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?)",
+        (table,),
+    ).fetchone()
+    seq_name = row[0] if row is not None else table
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (seq_name,))
+
+
 def _resolve_config_path(p: str | None, config_dir: Path) -> Path | None:
     if not p:
         return None
@@ -504,6 +514,17 @@ def parse_data_lines(text: str, skip_lines: int) -> tuple[str | None, list[str]]
     return header, rest
 
 
+def apply_profile_name_uniquify(row: dict[str, Any], mode: str | None) -> None:
+    if mode != "header_stem_designation":
+        return
+    name = row.get("profile_name")
+    code = row.get("profile_code")
+    size = row.get("profile_size")
+    if name is None or code is None or size is None:
+        return
+    row["profile_name"] = f"{name} | {code} | {size}"
+
+
 def decide_clear(
     *,
     clear_flag: bool,
@@ -529,6 +550,314 @@ def decide_clear(
     return ans in ("y", "yes", "\u0434", "\u0434\u0430")
 
 
+HARDWARE_CATEGORY_BY_FILE: dict[str, str] = {
+    "anker": "Анкер",
+    "bolt": "Болт",
+    "coupling": "Муфта",
+    "grover": "Гровер",
+    "nut": "Гайка",
+    "screws": "Саморез",
+    "spacer": "Шайба",
+    "stud": "Шпилька",
+}
+
+HARDWARE_CATEGORY_ORDER: list[str] = [
+    "Болт",
+    "Шайба",
+    "Гайка",
+    "Гровер",
+    "Шпилька",
+    "Анкер",
+    "Муфта",
+    "Саморез",
+]
+
+HARDWARE_CATEGORIES_TABLE = "HardwareCategories"
+HARDWARE_TYPES_TABLE = "HardwareTypes"
+PERFOMANCES_TABLE = "Perfomances"
+HARDWARE_CATEGORY_PERFOMANCE_TABLE = "HardwareCategoryPerfomance"
+
+HARDWARE_PERFOMANCE_VALUES_BY_CATEGORY: dict[str, list[str]] = {
+    "Болт": [
+        "3.6", "4.6", "4.8", "5.6", "5.8", "6.6", "6.8", "8.8", "9.8", "10.9", "12.9", "14.9",
+    ],
+    "Шпилька": [
+        "3.6", "4.6", "4.8", "5.6", "5.8", "6.6", "6.8", "8.8", "9.8", "10.9", "12.9", "14.9",
+    ],
+    "Гайка": ["5", "6", "8", "10", "12"],
+}
+
+
+def _parse_hw_float(raw: str) -> float | None:
+    s = raw.strip()
+    if not s or s == "-":
+        return None
+    try:
+        return float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def find_hardware_dir(root: Path, rules_path: Path) -> Path | None:
+    candidates: list[Path] = []
+    root_res = root.resolve()
+    candidates.append(root_res / "Hardwares")
+    candidates.append(root_res / "hardwares")
+    candidates.append(root_res.parent / "Hardwares")
+    candidates.append(root_res.parent / "hardwares")
+    rules_dir = rules_path.resolve().parent
+    candidates.append(rules_dir / "Hardwares")
+    candidates.append(rules_dir / "hardwares")
+
+    seen: set[Path] = set()
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.is_dir() and any(p.glob("*.csv")):
+            return p
+    return None
+
+
+def _split_hardware_blocks(lines: list[str]) -> list[list[list[str]]]:
+    blocks: list[list[list[str]]] = []
+    current: list[list[str]] | None = None
+    for line in lines:
+        row = _strip_trailing_empty([part.strip() for part in line.split(";")])
+        if not row:
+            continue
+        tag = row[0].strip().upper()
+        if tag == "<GOST>":
+            if current:
+                blocks.append(current)
+            current = [row]
+            continue
+        if current is not None:
+            current.append(row)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _parse_matrix_block(
+    gost: str, rows: list[list[str]]
+) -> tuple[list[tuple[str, float, float, float]], int]:
+    header = next((r for r in rows if r and r[0].strip().upper() == "<L\\D>"), None)
+    if header is None:
+        return [], 0
+    diameters = [_parse_hw_float(x) for x in header[1:]]
+    out: list[tuple[str, float, float, float]] = []
+    skipped = 0
+    for row in rows:
+        if not row:
+            continue
+        first = row[0].strip()
+        if not first or first.startswith("<"):
+            continue
+        length = _parse_hw_float(first)
+        if length is None:
+            skipped += 1
+            continue
+        for idx, mass_raw in enumerate(row[1:]):
+            if idx >= len(diameters):
+                break
+            diameter = diameters[idx]
+            mass = _parse_hw_float(mass_raw)
+            if diameter is None or mass is None:
+                continue
+            out.append((gost, diameter, length, mass))
+    return out, skipped
+
+
+def _parse_linear_block(
+    gost: str, rows: list[list[str]]
+) -> tuple[list[tuple[str, float, float, float]], int]:
+    d_row = next((r for r in rows if r and r[0].strip().upper() == "<D>"), None)
+    l_row = next((r for r in rows if r and r[0].strip().upper() == "<L>"), None)
+    m_row = next((r for r in rows if r and r[0].strip().upper() == "<M>"), None)
+    if d_row is None or l_row is None or m_row is None:
+        return [], 0
+    diameters = [_parse_hw_float(x) for x in d_row[1:]]
+    lengths = [_parse_hw_float(x) for x in l_row[1:]]
+    masses = [_parse_hw_float(x) for x in m_row[1:]]
+    n = min(len(diameters), len(lengths), len(masses))
+    out: list[tuple[str, float, float, float]] = []
+    skipped = 0
+    for idx in range(n):
+        diameter = diameters[idx]
+        length = lengths[idx]
+        mass = masses[idx]
+        if diameter is None or length is None or mass is None:
+            skipped += 1
+            continue
+        out.append((gost, diameter, length, mass))
+    return out, skipped
+
+
+def parse_hardware_csv(
+    text: str,
+) -> tuple[list[tuple[str, float, float, float]], int, int]:
+    rows = [line.strip() for line in text.splitlines() if line.strip()]
+    blocks = _split_hardware_blocks(rows)
+    out: list[tuple[str, float, float, float]] = []
+    skipped = 0
+    for block in blocks:
+        if not block or len(block[0]) < 2:
+            continue
+        gost = block[0][1].strip()
+        if not gost:
+            continue
+        block_rows = block[1:]
+        matrix_rows, matrix_skipped = _parse_matrix_block(gost, block_rows)
+        if matrix_rows:
+            out.extend(matrix_rows)
+            skipped += matrix_skipped
+            continue
+        linear_rows, linear_skipped = _parse_linear_block(gost, block_rows)
+        out.extend(linear_rows)
+        skipped += linear_skipped
+    return out, len(blocks), skipped
+
+
+def validate_hardware_tables(conn: sqlite3.Connection) -> None:
+    validate_columns(
+        conn,
+        HARDWARE_CATEGORIES_TABLE,
+        ["hardware_category_id", "hardware_category_name"],
+    )
+    validate_columns(
+        conn,
+        HARDWARE_TYPES_TABLE,
+        [
+            "hardware_type_id",
+            "hardware_type_code",
+            "diameter",
+            "length",
+            "mass_per_unit",
+            "hardware_category_id",
+        ],
+    )
+    validate_columns(
+        conn,
+        PERFOMANCES_TABLE,
+        ["perfomance_id", "perfomance_value"],
+    )
+    validate_columns(
+        conn,
+        HARDWARE_CATEGORY_PERFOMANCE_TABLE,
+        ["HardwareCategoriesHardwareCategoryId", "PerfomancesId"],
+    )
+
+
+def ensure_hardware_types_unique_index(conn: sqlite3.Connection) -> None:
+    index_rows = conn.execute(f"PRAGMA index_list({HARDWARE_TYPES_TABLE})").fetchall()
+    for _, index_name, is_unique, _, _ in index_rows:
+        if not is_unique:
+            continue
+        cols = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        col_names = [row[2] for row in cols]
+        if col_names == ["hardware_type_code"]:
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "UX_HardwareTypes_code_diameter_length_category "
+        "ON HardwareTypes (hardware_type_code, diameter, length, hardware_category_id)"
+    )
+
+
+def seed_hardware_categories(conn: sqlite3.Connection) -> dict[str, int]:
+    for name in HARDWARE_CATEGORY_ORDER:
+        conn.execute(
+            "INSERT OR IGNORE INTO HardwareCategories (hardware_category_name) VALUES (?)",
+            (name,),
+        )
+    rows = conn.execute(
+        "SELECT hardware_category_id, hardware_category_name FROM HardwareCategories"
+    ).fetchall()
+    out = {str(name): int(cid) for cid, name in rows}
+    missing = [name for name in HARDWARE_CATEGORY_ORDER if name not in out]
+    if missing:
+        raise SystemExit(f"Failed to seed hardware categories: {missing}")
+    return out
+
+
+def seed_perfomances(conn: sqlite3.Connection) -> dict[str, int]:
+    values: set[str] = set()
+    for perf_values in HARDWARE_PERFOMANCE_VALUES_BY_CATEGORY.values():
+        for value in perf_values:
+            values.add(value)
+    for value in sorted(values, key=lambda x: float(x)):
+        conn.execute(
+            f"INSERT OR IGNORE INTO {PERFOMANCES_TABLE} (perfomance_value) VALUES (?)",
+            (value,),
+        )
+    rows = conn.execute(
+        f"SELECT perfomance_id, perfomance_value FROM {PERFOMANCES_TABLE}"
+    ).fetchall()
+    return {str(value): int(pid) for pid, value in rows}
+
+
+def seed_hardware_category_perfomance_links(
+    conn: sqlite3.Connection,
+    category_ids: dict[str, int],
+    perfomance_ids: dict[str, int],
+) -> int:
+    count = 0
+    for category_name, values in HARDWARE_PERFOMANCE_VALUES_BY_CATEGORY.items():
+        category_id = category_ids.get(category_name)
+        if category_id is None:
+            raise SystemExit(f"Missing hardware category id for {category_name!r}")
+        for value in values:
+            perf_id = perfomance_ids.get(value)
+            if perf_id is None:
+                raise SystemExit(f"Missing perfomance id for value {value!r}")
+            conn.execute(
+                f"INSERT OR IGNORE INTO {HARDWARE_CATEGORY_PERFOMANCE_TABLE} "
+                "(HardwareCategoriesHardwareCategoryId, PerfomancesId) VALUES (?, ?)",
+                (category_id, perf_id),
+            )
+            count += 1
+    return count
+
+
+def collect_hardware_rows(
+    hardware_dir: Path, categories_map: dict[str, int]
+) -> tuple[list[tuple[str, float, float, float, int]], int, int, int]:
+    csv_files = sorted(hardware_dir.glob("*.csv"))
+    rows: list[tuple[str, float, float, float, int]] = []
+    total_blocks = 0
+    skipped = 0
+    skipped_files = 0
+    for csv_path in csv_files:
+        key = csv_path.stem.lower()
+        category_name = HARDWARE_CATEGORY_BY_FILE.get(key)
+        if category_name is None:
+            skipped_files += 1
+            print(f"skip hardware file (unknown category mapping): {csv_path.name}")
+            continue
+        category_id = categories_map.get(category_name)
+        if category_id is None:
+            raise SystemExit(
+                f"Missing hardware category id for {category_name!r} ({csv_path.name})"
+            )
+        text = read_file_text(csv_path, "auto")
+        parsed, block_count, skipped_rows = parse_hardware_csv(text)
+        total_blocks += block_count
+        skipped += skipped_rows
+        seen: set[tuple[str, float, float, float, int]] = set()
+        for gost, diameter, length, mass in parsed:
+            item = (gost, diameter, length, mass, category_id)
+            if item in seen:
+                continue
+            seen.add(item)
+            rows.append(item)
+        print(
+            f"{csv_path.name}: parsed {len(parsed)} rows, "
+            f"deduped to {len(seen)}, blocks {block_count}"
+        )
+    return rows, total_blocks, skipped, skipped_files
+
+
 def run_import(
     *,
     db_path: Path,
@@ -538,10 +867,18 @@ def run_import(
     clear_flag: bool,
     no_clear_flag: bool,
 ) -> None:
+    cfg_data = json.loads(read_json_text(rules_path))
+    profile_name_uniquify = cfg_data.get("profile_name_uniquify")
+    if profile_name_uniquify is not None:
+        profile_name_uniquify = str(profile_name_uniquify)
     rules, _, po = load_config(rules_path)
     jobs, tables = collect_jobs(root, rules)
     if not jobs:
         print("No .txt files found under root (or all skipped).", file=sys.stderr)
+        return
+    hardware_dir = find_hardware_dir(root, rules_path)
+    if hardware_dir is None:
+        print("Hardware folder not found (Hardwares/hardwares).", file=sys.stderr)
         return
 
     needs_outline_ids = any(
@@ -576,6 +913,28 @@ def run_import(
                 "(or pass --clear / --no-clear).",
                 file=sys.stderr,
             )
+        category_preview = {name: idx + 1 for idx, name in enumerate(HARDWARE_CATEGORY_ORDER)}
+        hardware_rows, block_count, skipped_hw, skipped_hw_files = collect_hardware_rows(
+            hardware_dir, category_preview
+        )
+        print(
+            f"[dry-run] Hardware dir: {hardware_dir} | "
+            f"rows: {len(hardware_rows)} | blocks: {block_count} | "
+            f"skipped rows: {skipped_hw} | skipped files: {skipped_hw_files}"
+        )
+        print(
+            "[dry-run] Would clear tables: "
+            "['HardwareTypes', 'HardwareCategories'] and reinsert hardware data"
+        )
+        perf_values = sorted(
+            {v for vals in HARDWARE_PERFOMANCE_VALUES_BY_CATEGORY.values() for v in vals},
+            key=lambda x: float(x),
+        )
+        links_count = sum(len(vals) for vals in HARDWARE_PERFOMANCE_VALUES_BY_CATEGORY.values())
+        print(
+            f"[dry-run] Would seed {len(perf_values)} rows in {PERFOMANCES_TABLE} "
+            f"and {links_count} rows in {HARDWARE_CATEGORY_PERFOMANCE_TABLE}"
+        )
         return
 
     do_clear = decide_clear(
@@ -587,6 +946,8 @@ def run_import(
 
     conn = sqlite3.connect(str(db_path))
     try:
+        validate_hardware_tables(conn)
+        ensure_hardware_types_unique_index(conn)
         outline_folder_ids: dict[str, int] | None = None
         if po is not None and needs_outline_ids:
             ot = str(po.get("table", "ProfileOutlines"))
@@ -620,6 +981,7 @@ def run_import(
             for t in sorted(tables):
                 _assert_safe_sql_ident(t)
                 conn.execute(f"DELETE FROM {t}")
+                reset_sqlite_identity(conn, t)
             print(f"Cleared tables: {sorted(tables)}")
 
         seq_state: dict[str, int] = {}
@@ -667,6 +1029,7 @@ def run_import(
                 if row is None:
                     skipped += 1
                     continue
+                apply_profile_name_uniquify(row, profile_name_uniquify)
                 batch.append(tuple(row[c] for c in insert_cols))
 
             if batch:
@@ -678,7 +1041,42 @@ def run_import(
             else:
                 print(f"{rel}: inserted {len(batch)}")
 
+        conn.execute(f"DELETE FROM {HARDWARE_CATEGORY_PERFOMANCE_TABLE}")
+        conn.execute("DELETE FROM HardwareTypes")
+        conn.execute(f"DELETE FROM {PERFOMANCES_TABLE}")
+        conn.execute("DELETE FROM HardwareCategories")
+        reset_sqlite_identity(conn, "HardwareTypes")
+        reset_sqlite_identity(conn, PERFOMANCES_TABLE)
+        reset_sqlite_identity(conn, "HardwareCategories")
+        print(
+            "Cleared tables: "
+            "['HardwareCategoryPerfomance', 'HardwareTypes', 'Perfomances', 'HardwareCategories']"
+        )
+        category_ids = seed_hardware_categories(conn)
+        perfomance_ids = seed_perfomances(conn)
+        links_inserted = seed_hardware_category_perfomance_links(
+            conn, category_ids, perfomance_ids
+        )
+        hardware_rows, block_count, skipped_hw, skipped_hw_files = collect_hardware_rows(
+            hardware_dir, category_ids
+        )
+        conn.executemany(
+            "INSERT INTO HardwareTypes "
+            "(hardware_type_code, diameter, length, mass_per_unit, hardware_category_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            hardware_rows,
+        )
+        total_hardware = len(hardware_rows)
+        print(
+            f"Hardware import: inserted {total_hardware} rows, "
+            f"blocks {block_count}, skipped rows {skipped_hw}, skipped files {skipped_hw_files}, "
+            f"perfomances {len(perfomance_ids)}, links {links_inserted}"
+        )
+
         conn.commit()
-        print(f"Done. Total rows inserted: {total_rows}")
+        print(
+            f"Done. Profiles rows inserted: {total_rows}. "
+            f"Hardware rows inserted: {total_hardware}"
+        )
     finally:
         conn.close()

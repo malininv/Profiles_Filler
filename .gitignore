@@ -3,3 +3,15 @@
 /Profiles
 /venv
 /__pycache__
+ComponentsLib.db
+ComponentsLib.db-shm
+ComponentsLib.db-wal
+Hardwares.zip
+Hardwares/anker.csv
+Hardwares/bolt.csv
+Hardwares/coupling.csv
+Hardwares/grover.csv
+Hardwares/nut.csv
+Hardwares/screws.csv
+Hardwares/spacer.csv
+Hardwares/stud.csv
